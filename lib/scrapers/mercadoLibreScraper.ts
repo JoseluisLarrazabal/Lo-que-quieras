@@ -1,151 +1,217 @@
-import { BaseScraper, type Product } from "./baseScraper"
+import { BaseScraper, Product, LoginCredentials } from "./baseScraper"
+
+interface MercadoLibreConfig {
+  useLogin?: boolean
+  credentials?: LoginCredentials
+}
 
 export class MercadoLibreScraper extends BaseScraper {
-  constructor() {
+  private isLoggedIn: boolean = false
+
+  constructor(config?: MercadoLibreConfig) {
     super({
       marketplace: "MercadoLibre",
       scraperType: "mercadoLibre",
+      useLogin: config?.useLogin || process.env.USE_LOGIN === 'true',
+      credentials: config?.credentials || {
+        email: process.env.ML_EMAIL || '',
+        password: process.env.ML_PASSWORD || ''
+      }
     })
   }
 
-  protected async scrapeResults(query: string): Promise<Product[]> {
-    if (!this.page) throw new Error("Page not initialized")
+  protected getMainDomain(): string {
+    return "https://www.mercadolibre.com.ar"
+  }
 
-    const products: Product[] = []
-    const searchUrl = `https://listado.mercadolibre.com.ar/${encodeURIComponent(query.replace(/\s+/g, "-"))}`
+  protected async performLogin(): Promise<boolean> {
+    if (!this.page || !this.credentials) return false
 
     try {
-      console.log(`🔍 Scraping MercadoLibre: ${searchUrl}`)
-
-      // Navegar a la página de búsqueda
-      await this.page.goto(searchUrl, {
-        waitUntil: "networkidle2",
-        timeout: 30000,
+      console.log('🔐 Starting MercadoLibre login process...')
+      
+      // Navegar a la página de login
+      await this.page.goto('https://www.mercadolibre.com.ar', {
+        waitUntil: 'networkidle0',
+        timeout: 30000
       })
 
-      // Esperar a que los resultados carguen
-      try {
-        await this.page.waitForSelector(".ui-search-layout__item", { timeout: 15000 })
-      } catch (error) {
-        console.log("⚠️ No se encontraron resultados en MercadoLibre")
-        return []
+      // Click en "Ingresá"
+      const loginLink = await this.page.$('a[data-link-id="login"]')
+      if (loginLink) {
+        await loginLink.click()
+        await this.page.waitForNavigation({ waitUntil: 'networkidle0' })
+      } else {
+        // Alternativa: ir directamente al login
+        await this.page.goto('https://www.mercadolibre.com/jms/mla/lgz/login', {
+          waitUntil: 'networkidle0'
+        })
       }
 
-      // Extraer datos directamente con evaluateHandle para mayor robustez
-      const extractedProducts = await this.page.evaluate(() => {
-        const items = Array.from(document.querySelectorAll(".ui-search-layout__item"))
+      await this.humanDelay(2000, 3000)
 
-        return items
-          .slice(0, 10)
-          .map((item) => {
-            try {
-              // Título
-              const titleElement = item.querySelector(".ui-search-item__title")
-              const title = titleElement ? titleElement.textContent?.trim() : null
-
-              // Precio
-              const priceElement = item.querySelector(".price-tag-fraction")
-              const priceText = priceElement
-                ? priceElement.textContent?.trim().replace(/\./g, "").replace(/,/g, ".")
-                : null
-              const price = priceText ? Number.parseFloat(priceText) : 0
-
-              // URL
-              const linkElement = item.querySelector("a.ui-search-link")
-              const url = linkElement ? linkElement.getAttribute("href") : null
-
-              // Imagen
-              const imgElement = item.querySelector("img.ui-search-result-image__element")
-              const imageUrl = imgElement
-                ? imgElement.getAttribute("data-src") ||
-                  imgElement.getAttribute("src") ||
-                  "/placeholder.svg?height=200&width=200"
-                : "/placeholder.svg?height=200&width=200"
-
-              // Ubicación
-              const locationElement = item.querySelector(".ui-search-item__location")
-              const location = locationElement ? locationElement.textContent?.trim() : ""
-
-              // Descripción
-              const description = location ? `Ubicación: ${location}` : "Producto de MercadoLibre"
-
-              return {
-                title,
-                price,
-                url,
-                imageUrl,
-                description,
-                valid: !!(title && price && url),
-              }
-            } catch (error) {
-              return { valid: false }
-            }
-          })
-          .filter((p) => p.valid)
-      })
-
-      console.log(`📦 Extrayendo datos de ${extractedProducts.length} productos de MercadoLibre`)
-
-      // Convertir los datos extraídos al formato Product
-      for (const item of extractedProducts) {
-        if (item.valid && item.title && item.url) {
-          products.push(
-            this.createProduct(
-              item.title,
-              item.price || 0,
-              item.url,
-              item.imageUrl || "/placeholder.svg?height=200&width=200",
-              item.description || "",
-              this.categorizeProduct(item.title),
-            ),
-          )
-        }
+      // Ingresar email/usuario
+      const emailSelector = 'input[name="user_id"], input#user_id'
+      await this.waitForSelectorWithRetry(emailSelector)
+      await this.typeHumanLike(emailSelector, this.credentials.email)
+      
+      // Click en continuar
+      const continueButton = await this.page.$('button[type="submit"], span.andes-button__content')
+      if (continueButton) {
+        await continueButton.click()
+        await this.humanDelay(2000, 3000)
       }
 
-      console.log(`✅ Scraping exitoso: ${products.length} productos de MercadoLibre`)
-      return products
+      // Ingresar contraseña
+      const passwordSelector = 'input[name="password"], input#password'
+      await this.waitForSelectorWithRetry(passwordSelector)
+      await this.typeHumanLike(passwordSelector, this.credentials.password)
+
+      // Click en ingresar
+      const submitButton = await this.page.$('button[type="submit"], button#action-complete')
+      if (submitButton) {
+        await submitButton.click()
+        
+        // Esperar navegación
+        await this.page.waitForNavigation({
+          waitUntil: 'networkidle0',
+          timeout: 30000
+        }).catch(() => {})
+      }
+
+      await this.humanDelay(3000, 5000)
+
+      // Verificar login exitoso
+      const loginSuccess = await this.checkIfLoggedIn()
+      
+      if (loginSuccess) {
+        console.log('✅ MercadoLibre login successful')
+        this.isLoggedIn = true
+        return true
+      } else {
+        console.warn('⚠️ MercadoLibre login failed')
+        return false
+      }
     } catch (error) {
-      console.error("Error en scraping de MercadoLibre:", error)
-      return []
+      console.error('❌ Error during MercadoLibre login:', error)
+      return false
     }
   }
 
-  private categorizeProduct(title: string): string {
-    const titleLower = title.toLowerCase()
+  private async checkIfLoggedIn(): Promise<boolean> {
+    if (!this.page) return false
 
-    if (
-      titleLower.includes("iphone") ||
-      titleLower.includes("samsung") ||
-      titleLower.includes("celular") ||
-      titleLower.includes("smartphone")
-    ) {
-      return "Celulares"
-    }
-    if (
-      titleLower.includes("notebook") ||
-      titleLower.includes("laptop") ||
-      titleLower.includes("macbook") ||
-      titleLower.includes("computadora")
-    ) {
-      return "Computación"
-    }
-    if (titleLower.includes("tv") || titleLower.includes("televisor") || titleLower.includes("smart tv")) {
-      return "TV y Audio"
-    }
-    if (
-      titleLower.includes("zapatillas") ||
-      titleLower.includes("zapatos") ||
-      titleLower.includes("nike") ||
-      titleLower.includes("adidas")
-    ) {
-      return "Ropa y Calzado"
-    }
+    try {
+      // Verificar elementos que indican login exitoso
+      const loggedInSelectors = [
+        'a[data-link-id="profile"]',
+        'a[data-link-id="my-account"]',
+        'div[data-testid="user-menu"]'
+      ]
 
-    return "Electrónicos"
+      for (const selector of loggedInSelectors) {
+        const element = await this.page.$(selector)
+        if (element) return true
+      }
+
+      return false
+    } catch (error) {
+      console.error('Error checking login status:', error)
+      return false
+    }
+  }
+
+  public async search(query: string): Promise<Product[]> {
+    const startTime = Date.now()
+    
+    try {
+      console.log(`🔍 Starting MercadoLibre search for: "${query}"`)
+      
+      await this.initialize()
+      
+      // Delay inicial aleatorio
+      await this.humanDelay(2000, 5000)
+      
+      const results = await this.scrapeWithRetry(
+        () => this.scrapeResults(query),
+        "MercadoLibre search"
+      ) || []
+      
+      const duration = Date.now() - startTime
+      console.log(`✅ MercadoLibre search completed in ${duration}ms - Found ${results.length} products`)
+      
+      return results
+    } catch (error) {
+      const duration = Date.now() - startTime
+      console.error(`❌ MercadoLibre search failed after ${duration}ms:`, error)
+      return []
+    } finally {
+      await this.close()
+    }
+  }
+
+  private async scrapeResults(query: string): Promise<Product[]> {
+    if (!this.page) return []
+
+    try {
+      // Primero visitar la página principal
+      await this.page.goto("https://www.mercadolibre.com.ar/", {
+        waitUntil: "networkidle0",
+        timeout: 30000
+      })
+
+      // Simular comportamiento humano
+      await this.simulateHumanBehavior()
+      await this.humanDelay()
+
+      // Construir URL de búsqueda
+      const searchUrl = `https://listado.mercadolibre.com.ar/${encodeURIComponent(query)}`
+      
+      // Navegar a la página de resultados
+      await this.page.goto(searchUrl, {
+        waitUntil: "networkidle0",
+        timeout: 30000
+      })
+
+      // Simular comportamiento humano
+      await this.simulateHumanBehavior()
+      await this.humanDelay()
+
+      // Extraer resultados
+      const results = await this.page.evaluate(() => {
+        const items = document.querySelectorAll("li.ui-search-layout__item")
+        return Array.from(items).map((item) => {
+          const titleElement = item.querySelector("h2.ui-search-item__title")
+          const priceElement = item.querySelector("span.price-tag-fraction")
+          const linkElement = item.querySelector("a.ui-search-link") as HTMLAnchorElement
+          const imageElement = item.querySelector("img.ui-search-result-image__element") as HTMLImageElement
+
+          return {
+            title: titleElement?.textContent?.trim() || "",
+            price: parseFloat(priceElement?.textContent?.replace(/[^\d]/g, "") || "0"),
+            url: linkElement?.href || "",
+            imageUrl: imageElement?.src || "",
+          }
+        })
+      })
+
+      // Convertir a formato Product
+      return results.map((result) =>
+        this.createProduct(
+          result.title,
+          result.price,
+          result.url,
+          result.imageUrl
+        )
+      )
+    } catch (error) {
+      console.error("Error scraping MercadoLibre:", error)
+      return []
+    }
   }
 }
 
 export async function searchMercadoLibre(query: string): Promise<Product[]> {
   const scraper = new MercadoLibreScraper()
-  return await scraper.search(query)
-}
+  return scraper.search(query)
+} 
